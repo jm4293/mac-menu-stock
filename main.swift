@@ -23,7 +23,16 @@ struct Config {
     var debug: Bool = false          // 원본 응답 로그 기록
     var useWebSocket: Bool = true    // 실시간 웹소켓 사용(주식 체결)
     // 실시간 체결 코드: US3=통합(KRX+NXT), S3_=KOSPI, K3_=KOSDAQ, NS3=NXT
-    var realtimeCodes: [String] = ["US3"]
+    // 시각에 따라 자동 전환:
+    //  - 정규장(평일 09:00~15:30): KRX 체결 코드 (S3_=코스피, K3_=코스닥) — 둘 다 구독, 해당 시장만 수신
+    //  - 정규장 외 NXT 운영시간(08:00~09:00, 15:30~20:00): NXT 체결 코드 (NS3)
+    // autoSwitchSession=false 면 항상 realtimeCodesKRX 사용(예: ["US3"] 통합 고정).
+    var autoSwitchSession: Bool = true                // 시각 기준 KRX↔NXT 자동 전환
+    var realtimeCodesKRX: [String] = ["S3_", "K3_"]   // 정규장 체결 코드(웹소켓)
+    var realtimeCodesNXT: [String] = []               // NXT 웹소켓 체결 코드(현재 미지원 — REST로 처리)
+    // REST 현재가(t1102) 거래소 구분(exchgubun): ""=KRX, "N"=NXT, "U"=통합(KRX+NXT)
+    var stockExchKRX: String = ""    // 정규장 세션: KRX 시세
+    var stockExchNXT: String = "U"   // 정규장 외 세션: 통합(NXT 거래 반영, 미거래 종목은 KRX 종가)
 
     var isConfigured: Bool {
         !appkey.isEmpty && !appkey.contains("여기에") &&
@@ -84,7 +93,15 @@ func loadConfig() -> Config? {
     cfg.useColor = (obj["useColor"] as? Bool) ?? true
     cfg.debug = (obj["debug"] as? Bool) ?? false
     cfg.useWebSocket = (obj["useWebSocket"] as? Bool) ?? true
-    if let arr = obj["realtimeCodes"] as? [String], !arr.isEmpty { cfg.realtimeCodes = arr }
+    cfg.autoSwitchSession = (obj["autoSwitchSession"] as? Bool) ?? true
+    // 구버전 호환: 단일 realtimeCodes 가 있으면 양쪽 세션 기본값으로 적용
+    if let legacy = obj["realtimeCodes"] as? [String], !legacy.isEmpty {
+        cfg.realtimeCodesKRX = legacy; cfg.realtimeCodesNXT = legacy
+    }
+    if let arr = obj["realtimeCodesKRX"] as? [String], !arr.isEmpty { cfg.realtimeCodesKRX = arr }
+    if let arr = obj["realtimeCodesNXT"] as? [String] { cfg.realtimeCodesNXT = arr }
+    if let v = obj["stockExchKRX"] as? String { cfg.stockExchKRX = v }
+    if let v = obj["stockExchNXT"] as? String { cfg.stockExchNXT = v }
 
     if let arr = obj["indices"] as? [String], !arr.isEmpty { cfg.indices = arr }
     else if let one = obj["indexCode"] as? String { cfg.indices = [one] }
@@ -106,7 +123,11 @@ func saveConfig(_ cfg: Config) {
         "stocks": cfg.stocks,
         "debug": cfg.debug,
         "useWebSocket": cfg.useWebSocket,
-        "realtimeCodes": cfg.realtimeCodes
+        "autoSwitchSession": cfg.autoSwitchSession,
+        "realtimeCodesKRX": cfg.realtimeCodesKRX,
+        "realtimeCodesNXT": cfg.realtimeCodesNXT,
+        "stockExchKRX": cfg.stockExchKRX,
+        "stockExchNXT": cfg.stockExchNXT
     ]
     try? FileManager.default.createDirectory(at: configDirURL(), withIntermediateDirectories: true)
     if let data = try? JSONSerialization.data(withJSONObject: dict,
@@ -168,6 +189,36 @@ func formatNumber(_ v: Double, decimals: Int) -> String {
 func firstDouble(_ dict: [String: Any], _ keys: [String]) -> Double? {
     for k in keys { if let v = anyToDouble(dict[k]) { return v } }
     return nil
+}
+
+// MARK: - 장 세션 판단 (한국시간 기준)
+
+enum MarketSession: String {
+    case krx = "정규장"      // 평일 09:00~15:30 (KRX)
+    case nxt = "NXT"        // 정규장 외 NXT 운영시간 (08:00~09:00, 15:30~20:00)
+    case closed = "장마감"   // 그 외(심야·주말)
+}
+
+// 한국시간(Asia/Seoul) 기준 현재 세션. 주말(토·일)은 휴장.
+func currentMarketSession(_ date: Date = Date()) -> MarketSession {
+    var cal = Calendar(identifier: .gregorian)
+    cal.timeZone = TimeZone(identifier: "Asia/Seoul") ?? .current
+    let c = cal.dateComponents([.weekday, .hour, .minute], from: date)
+    guard let wd = c.weekday, let h = c.hour, let m = c.minute else { return .closed }
+    if wd == 1 || wd == 7 { return .closed }       // 1=일, 7=토 → 휴장
+    let mins = h * 60 + m
+    let krxOpen = 9 * 60, krxClose = 15 * 60 + 30  // 09:00 ~ 15:30 정규장
+    let nxtOpen = 8 * 60, nxtClose = 20 * 60       // 08:00 ~ 20:00 NXT 운영시간
+    if mins >= krxOpen && mins < krxClose { return .krx }
+    if mins >= nxtOpen && mins < nxtClose { return .nxt }
+    return .closed
+}
+
+func seoulTimeString(_ date: Date = Date()) -> String {
+    let f = DateFormatter()
+    f.timeZone = TimeZone(identifier: "Asia/Seoul")
+    f.dateFormat = "HH:mm"
+    return f.string(from: date)
 }
 
 // MARK: - LS OpenAPI 클라이언트
@@ -239,10 +290,12 @@ final class LSClient {
         return obj
     }
 
-    // 주식 현재가(시세) — t1102
-    func fetchStock(code: String) async throws -> Quote {
+    // 주식 현재가(시세) — t1102. exchgubun: ""=KRX, "N"=NXT, "U"=통합(KRX+NXT)
+    func fetchStock(code: String, exchgubun: String = "") async throws -> Quote {
+        var params: [String: Any] = ["shcode": code]
+        if !exchgubun.isEmpty { params["exchgubun"] = exchgubun }
         let obj = try await query(path: "/stock/market-data", trCd: "t1102",
-                                  inBlock: "t1102InBlock", params: ["shcode": code])
+                                  inBlock: "t1102InBlock", params: params)
         guard let out = obj["t1102OutBlock"] as? [String: Any] else { throw APIError.parse("t1102OutBlock") }
         let price = firstDouble(out, ["price"]) ?? 0
         var base = firstDouble(out, ["recprice", "jnilclose"]) ?? 0
@@ -315,13 +368,22 @@ final class LSWebSocket: NSObject, URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
                     didOpenWithProtocol proto: String?) {
-        for s in subs { send(trType: "3", trCd: s.cd, trKey: s.key) }
+        onRaw?("[OPEN] 웹소켓 연결됨 — 구독 \(subs.count)건 전송")
+        for s in subs { send(trType: "3", trCd: s.cd, trKey: s.key); onRaw?("[SUB→] \(s.cd) / \(s.key)") }
         DispatchQueue.main.async { [weak self] in
             self?.pingTimer?.invalidate()
             self?.pingTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-                self?.task?.sendPing { _ in }
+                self?.task?.sendPing { err in
+                    if let e = err { self?.onRaw?("[PING-FAIL] \(e.localizedDescription)") }
+                }
             }
         }
+    }
+
+    func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask,
+                    didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
+        let r = reason.flatMap { String(data: $0, encoding: .utf8) } ?? ""
+        onRaw?("[CLOSE] 서버가 연결 종료 code=\(closeCode.rawValue) \(r)")
     }
 
     private func send(trType: String, trCd: String, trKey: String) {
@@ -329,7 +391,9 @@ final class LSWebSocket: NSObject, URLSessionWebSocketDelegate {
                                   "body": ["tr_cd": trCd, "tr_key": trKey]]
         guard let d = try? JSONSerialization.data(withJSONObject: msg),
               let s = String(data: d, encoding: .utf8) else { return }
-        task?.send(.string(s)) { _ in }
+        task?.send(.string(s)) { [weak self] err in
+            if let e = err { self?.onRaw?("[SEND-FAIL] \(trCd): \(e.localizedDescription)") }
+        }
     }
 
     private func receive() {
@@ -339,10 +403,12 @@ final class LSWebSocket: NSObject, URLSessionWebSocketDelegate {
             case .success(let msg):
                 if case .string(let text) = msg { self.handle(text) }
                 if !self.closed { self.receive() }
-            case .failure:
+            case .failure(let err):
                 guard !self.closed else { return }
+                self.onRaw?("[FAIL] 수신 오류: \(err.localizedDescription) → 3초 후 재연결")
                 DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
                     guard let self = self, !self.closed else { return }
+                    self.onRaw?("[RECONNECT] 재연결 시도")
                     self.task = self.session.webSocketTask(with: self.url)
                     self.task?.resume()
                     self.receive()
@@ -381,6 +447,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var ws: LSWebSocket?
     var liveTick = Set<String>()      // 실시간 체결이 들어온 종목코드
     var wsLog: [String] = []          // 실시간 원본 메시지(진단용)
+    var sessionTimer: Timer?          // 정규장↔NXT 세션 변화 감시
+    var currentSession: MarketSession = .closed
 
     // 값 변동 시 잠깐 색을 깜빡이기 위한 상태
     var prevPrices: [String: Double] = [:]
@@ -419,6 +487,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func reload() {
         timer?.invalidate()
+        sessionTimer?.invalidate()
         ws?.close(); ws = nil
         liveTick = []
         config = loadConfig()
@@ -429,7 +498,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 self?.refresh()
             }
             refresh()
-            if cfg.useWebSocket { startWebSocket() }
+            if cfg.useWebSocket {
+                startWebSocket()
+                // 30초마다 세션(정규장↔NXT↔장마감) 변화를 감지해 자동 재구독
+                sessionTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+                    self?.checkSessionChange()
+                }
+            }
         } else {
             client = nil
             quotes = []
@@ -449,8 +524,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 do { result.append(try await client.fetchIndex(code: code)) }
                 catch { if firstError == nil { firstError = "\(error)" } }
             }
+            // 세션별 거래소 구분: 정규장=KRX, 그 외=통합(NXT 반영)
+            let exch = (currentMarketSession() == .krx) ? cfg.stockExchKRX : cfg.stockExchNXT
             for code in cfg.stocks {
-                do { result.append(try await client.fetchStock(code: code)) }
+                do { result.append(try await client.fetchStock(code: code, exchgubun: exch)) }
                 catch { if firstError == nil { firstError = "\(error)" } }
             }
             let snapshot = result
@@ -488,9 +565,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    // 웹소켓 시작: 종목별 KRX 체결(S3_/K3_) 구독
+    // 웹소켓 시작: 현재 세션(정규장=KRX / 그 외=NXT)에 맞는 체결 코드로 구독
     func startWebSocket() {
         guard let client = client, let cfg = config, cfg.useWebSocket else { return }
+        currentSession = currentMarketSession()
+        guard currentSession != .closed else {
+            wsLog.append("장마감 시간 — 실시간 미연결 (\(seoulTimeString()) KST)")
+            return
+        }
         Task {
             do {
                 let tok = try await client.accessToken()
@@ -501,22 +583,47 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    // 세션(정규장↔NXT↔장마감)이 바뀌면 웹소켓을 새 세션 코드로 재구독
+    func checkSessionChange() {
+        guard let cfg = config, cfg.useWebSocket, cfg.autoSwitchSession else { return }
+        let s = currentMarketSession()
+        guard s != currentSession else { return }
+        currentSession = s
+        wsLog.append("⟳ 세션 전환 → \(s.rawValue) (\(seoulTimeString()) KST)")
+        ws?.close(); ws = nil
+        if s == .closed {           // 장마감: 실시간 종료, 마지막 가격은 유지
+            updateStatusTitle(); buildMenu(); return
+        }
+        startWebSocket()
+        updateStatusTitle(); buildMenu()
+    }
+
+    // 현재 세션에 맞는 실시간 체결 코드
+    func realtimeCodesForCurrentSession(_ cfg: Config) -> [String] {
+        if cfg.autoSwitchSession && currentSession == .nxt { return cfg.realtimeCodesNXT }
+        return cfg.realtimeCodesKRX   // 정규장 또는 자동전환 OFF
+    }
+
     func connectWS(token: String, cfg: Config) {
         let sock = LSWebSocket(token: token)
         sock.onRaw = { [weak self] text in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.wsLog.append(text)
-                if self.wsLog.count > 30 { self.wsLog.removeFirst(self.wsLog.count - 30) }
+                let f = DateFormatter(); f.timeZone = TimeZone(identifier: "Asia/Seoul")
+                f.dateFormat = "HH:mm:ss"
+                self.wsLog.append("[\(f.string(from: Date()))] \(text)")
+                if self.wsLog.count > 60 { self.wsLog.removeFirst(self.wsLog.count - 60) }
             }
         }
         sock.onMessage = { [weak self] _, trKey, body in
             let price = firstDouble(body, ["price", "jisu", "pricejisu", "cur", "now"]) ?? 0
             DispatchQueue.main.async { self?.applyTick(code: trKey, price: price) }
         }
+        let codes = realtimeCodesForCurrentSession(cfg)
+        wsLog.append("연결: \(currentSession.rawValue) 세션 · 구독 [\(codes.joined(separator: ", "))] (\(seoulTimeString()) KST)")
         var subscriptions: [(String, String)] = []
         for code in cfg.stocks {
-            for tr in cfg.realtimeCodes {          // 기본 US3(통합): 정규장 KRX + 장후 NXT
+            for tr in codes {                      // 정규장=KRX(S3_/K3_), 그 외=NXT(NS3)
                 subscriptions.append((tr, code))
             }
         }
@@ -622,6 +729,15 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if let t = lastUpdate {
             let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
             let it = NSMenuItem(title: "마지막 갱신: \(f.string(from: t))", action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            menu.addItem(it)
+        }
+        do {
+            let s = currentMarketSession()
+            let exch = (s == .krx) ? (config?.stockExchKRX ?? "") : (config?.stockExchNXT ?? "U")
+            let exchLabel = exch.isEmpty ? "KRX" : (exch == "U" ? "통합" : (exch == "N" ? "NXT" : exch))
+            let it = NSMenuItem(title: "시세: \(s.rawValue) · \(exchLabel) (\(seoulTimeString()) KST)",
+                                action: nil, keyEquivalent: "")
             it.isEnabled = false
             menu.addItem(it)
         }
@@ -763,10 +879,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func diagnoseRealtime() {
-        let text = wsLog.isEmpty
-            ? "(아직 실시간 메시지가 없습니다 — 정규장 시간에 잠시 후 다시 시도)"
-            : wsLog.suffix(15).joined(separator: "\n\n")
-        showScrollable("실시간(웹소켓) 원본 메시지  (⌘A → ⌘C 복사 가능)", text)
+        let s = currentMarketSession()
+        let codes = (config.map { realtimeCodesForCurrentSession($0) } ?? []).joined(separator: ", ")
+        var header = "현재 세션: \(s.rawValue)  (\(seoulTimeString()) KST)\n"
+        header += "구독 코드: [\(codes)]\n"
+        if s == .closed { header += "장마감 시간 — 실시간 미연결 상태입니다.\n" }
+        header += "\n"
+        let body = wsLog.isEmpty
+            ? "(아직 실시간 메시지가 없습니다 — 운영시간에 잠시 후 다시 시도)"
+            : wsLog.suffix(40).joined(separator: "\n")
+        showScrollable("실시간(웹소켓) 진단  (⌘A → ⌘C 복사 가능)", header + body)
     }
 
     @objc func openConfig() { _ = loadConfig(); NSWorkspace.shared.open(configFileURL()) }
